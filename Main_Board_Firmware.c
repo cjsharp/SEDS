@@ -17,7 +17,6 @@
 #define IN_DAQ_COUNT 12 
 #define NUM_OF_SWITCHES 12 //total number of switches 
 #define STARTKEY 255 //indicates beginning of an array message
-#define TIMEOUT 3000 //time until communication is considered missing
 /*Define UART operation const*/
 #define FOSC 11059200L //system oscillator frequency
 #define BAUD 9600 //baud rate
@@ -31,8 +30,6 @@
  *************************************************************************/
 // CHANGE ALL VARS AND ADJUST
 sbit ACT_MUX_S = P3^5;
-sbit Rx2_3 = P1^2;
-sbit Tx2_4 = P1^3;
 
 sbit A1 = P0^0;
 sbit A2 = P0^1;
@@ -60,10 +57,11 @@ sbit MUX_OUT4 = P1^7;
 void uart_init(); //Initialize UART1 and UART2 sfr
 void uart1_tx(unsigned char dat); //UART1 transmit single byte
 void send(); //UART1 send output array
-void timer0_init(); //Initialize Timer0 sfr
 void delay(unsigned int n); //Software delay function
 void CRC_generator();  //in send() function
 bit CRC_check();
+void update_output_array();
+void solenoid_data();
 
 /*************************************************************************
  *                          --GLOBAL VARIABLES--
@@ -80,14 +78,12 @@ unsigned char input_DAQ[IN_DAQ_COUNT]; //stores all commands to be sent
 /* [0-3,errors][4-7,warnings][8-11,pressure valves] */
 unsigned char switchs[NUM_OF_SWITCHES];
 
-
 int i = 0; //for loops
 bit busy; //boolean for UART TX holding
 unsigned char index_control = 0; //for UART RX array location
 unsigned char index_DAQ = 0; //for UART RX array location
 bit storing_DAQ = 0; //1 if currently updating RX2 (input_DAQ) array, 0 otherwise
 bit storing_control = 0; //1 if currently updating RX1 (input_control) array, 0 otherwise
-unsigned int comms_timeout_count = TIMEOUT; //countdown to timeout, 3sec
 
 /*************************************************************************
  *                          -- MAIN FUNCTION --
@@ -105,86 +101,97 @@ unsigned int comms_timeout_count = TIMEOUT; //countdown to timeout, 3sec
  *
  *  @RETURN: none
  *************************************************************************/
-void main() {
-	unsigned int counter = 0;	
-	unsigned int x = 200;
+void main() {	
 	crc_init();
 	P4SW = 0x70; //enable IO for all of P4
-	uart_init(); //Initialize UART1 and UART2 sfr.
-	timer0_init(); //Initialize Timer0 sfr
+	uart_init(); //Initialize UART1 and UART2 sfr
 	EA = 1; //Open master interrupt switch
 	while(1) {
-		// Even odd
-		// Top bottom			  //use IN_MUX pins to select info about 
-		IN_MUX_S = 1; 			  //certain solenoids and their states
-  		IN_MUX_E = 1;	
-	  	switchs[2] = MUX_OUT1;
-	  	switchs[4] = MUX_OUT2;
-  		switchs[6] = MUX_OUT3;
-  		switchs[8] = MUX_OUT4;	
-
-	 	delay(200);
-  		IN_MUX_S = 1;
-  		IN_MUX_E = 0;	
-  		switchs[10] = MUX_OUT1;
-  		switchs[12] = MUX_OUT2;
-//		switchs[14] = MUX_OUT3;	  //maybe adding more solenoids in the future?
-	  	delay(200);
-			  
-	    IN_MUX_S = 0;
-	  	IN_MUX_E = 1;	
-	  	switchs[1] = MUX_OUT1;
-	  	switchs[3] = MUX_OUT2;
-	  	switchs[5] = MUX_OUT3;
-		switchs[7] = MUX_OUT4;	
-		delay(200);					//why this delay?
+		solenoid_data();
+											    
+		update_output_array();
 		
-		IN_MUX_S = 0;
-  		IN_MUX_E = 0;	
-	  	switchs[9] = MUX_OUT1;
-	  	switchs[11] = MUX_OUT2;	  //maybe adding more solenoids in the future?
-//  		switchs[13] = MUX_OUT3;			   //if override is 1 and CRC_check is 1, send override values to A1 
-											   //through A12. Compare values of A1-A12 to actual solenoid states 
-		output[0]=input_control[0];			   //and store that comparison in output array so that it gets sent to
-		if(input_control[0]==1 & CRC_check()==1)	 //control board through UART1. 
-		{									 
-			ACT_MUX_S=0;
-			A1=input_control[1]; A2=input_control[2]; A3=input_control[3]; A4=input_control[4];
-			A5=input_control[5]; A6=input_control[6]; A7=input_control[7]; A8=input_control[8];
-			A9=input_control[9]; A10=input_control[10]; A11=input_control[11]; A12=input_control[12];
-			for(i=1;i<NUM_OF_SWITCHES;++i)
-			{
-				if(switchs[i]==1 & input_control[i]==1)	   
-				{										   
-					output[i]=1;						   
-				}										   
-				else if (switchs[i]==0 &  input_control[i]==0)
-				{										   
-					output[i]=0;						   
-				}
-				else if (switchs[i]==0 &  input_control[i]==1)
-				{
-					output[i]=2;
-				}
-			}								//if "if statement" fails, then forward solenoid state 
-		}									//values from the MUX. Do nothin w/ pins A1-A12
-		else 
-		{
-			ACT_MUX_S=1;
-			for(i=1;i<=NUM_OF_SWITCHES;++i)
-			{
-				output[i]=switchs[i];
-			}
-		}
-		
-		for(i=0;i<IN_DAQ_COUNT;++i)			 //update output array with info from DAQ
-		{
-			output[13+i]=input_DAQ[i];
-		}
-		
-		send();								 //and send that composite data (CRC in send() function)
+		send();								 //and send that composite data (CRC_generator in send() function)
 	}	 
 } //end main
+
+/*----------------------------
+Takes info from DAQ (stored in input_DAQ)
+and info from control board (stored in 
+input_control) and updates output array.
+CRC_generator (called in function) also 
+changes last 2 values of output array.
+output array is later sent to control board
+through UART1 in the send() function 
+----------------------------*/
+void update_output_array() {
+	output[0]=input_control[0];			   
+	if(input_control[0]==1 & CRC_check()==1)	//if override is 1 and CRC_check is 1, send override 
+	{									 		//values to A1 through A12. 
+		ACT_MUX_S=0;
+		A1=input_control[1]; A2=input_control[2]; A3=input_control[3]; A4=input_control[4];
+		A5=input_control[5]; A6=input_control[6]; A7=input_control[7]; A8=input_control[8];
+		A9=input_control[9]; A10=input_control[10]; A11=input_control[11]; A12=input_control[12];
+		for(i=1;i<NUM_OF_SWITCHES;++i)
+		{
+			if(switchs[i]==1 & input_control[i]==1)	   		 //Compare values of A1-A12 to actual solenoid states
+			{										   		 //and store that comparison in output array so that it
+				output[i]=1;						   		 //gets sent to control board through UART1. 
+			}										   		   
+			else if (switchs[i]==0 &  input_control[i]==0)	 //0=inactive 
+			{										   		 //1=active
+				output[i]=0;						   		 //2=pending (switched HIGH, but solenoid is not actually HIGH yet)
+			}
+			else if (switchs[i]==0 &  input_control[i]==1)
+			{
+				output[i]=2;
+			}
+		}								  
+	}									
+	else 								
+	{									//if CRC doesn't check or override is LOW, do not forward inputs
+		ACT_MUX_S=1;					//and set ACT_MUX_S to HIGH so solenoids take commands from DAQ
+		for(i=1;i<=NUM_OF_SWITCHES;++i)	//instead of control board
+		{
+			output[i]=switchs[i];
+		}
+	}
+	CRC_generator();					 //adds CRC to end out of OUTPUT array
+	for(i=0;i<IN_DAQ_COUNT;++i)			 //update output array with info from DAQ (UART2)
+	{									 //forwarding info from UART2 to array that is sent
+		output[13+i]=input_DAQ[i];		 //to control board via UART1
+	}			    
+}
+
+/*----------------------------
+Uses IN_MUX pins to select info about
+solenoids and their states and stores
+that info in switchs array
+----------------------------*/
+void solenoid_data() {
+	IN_MUX_S = 1; 			  						  
+	IN_MUX_E = 1;			  
+  	switchs[2] = MUX_OUT1;	  //even top
+  	switchs[4] = MUX_OUT2;	  
+	switchs[6] = MUX_OUT3;
+	switchs[8] = MUX_OUT4;	
+	IN_MUX_S = 1;
+	IN_MUX_E = 0;	
+	switchs[10] = MUX_OUT1;
+	switchs[12] = MUX_OUT2;
+//	switchs[14] = MUX_OUT3;	  //maybe adding more solenoids in the future?
+    IN_MUX_S = 0;
+  	IN_MUX_E = 1;	
+  	switchs[1] = MUX_OUT1;	  //odd bottom
+  	switchs[3] = MUX_OUT2;
+  	switchs[5] = MUX_OUT3;
+	switchs[7] = MUX_OUT4;
+	IN_MUX_S = 0;
+	IN_MUX_E = 0;	
+  	switchs[9] = MUX_OUT1;
+  	switchs[11] = MUX_OUT2;	  //maybe adding more solenoids in the future?
+//  switchs[13] = MUX_OUT3;			    
+}
 
 /*----------------------------
 Initialize UART1 and UART2 sfr.
@@ -210,7 +217,6 @@ void uart_init() {
 		input_control[i] = 0;
 	for(i = 0; i < IN_DAQ_COUNT; ++i) //initialize input_control array to zeros
 		input_DAQ[i] = 0;
-	output[0] = STARTKEY;
 }
 
 /*----------------------------
@@ -220,7 +226,6 @@ Updates the input_control array.
 void Uart_Isr() interrupt 4 using 1 {
 	unsigned char c;
 	if(RI) { //receive1 flagged
-		comms_timeout_count = TIMEOUT;
 		RI = 0; //reset receive flag
 		c = SBUF; //store buffer in c
 		if(c == STARTKEY) { //start key is received
@@ -241,7 +246,6 @@ void Uart_Isr() interrupt 4 using 1 {
 	}
 }
 
-
 /*----------------------------
 UART1 transmit single byte
 ----------------------------*/
@@ -255,7 +259,6 @@ void uart1_tx(unsigned char dat) {
 UART1 send output array
 ----------------------------*/
 void send() {
-	CRC_generator();
 	uart1_tx(0xFF);							 //send startbyte
 	for(i = 0; i < OUT_COUNT; ++i) {		 //send entire output array 
 		uart1_tx(output[i]);				 //include "override" char so that control board knows 
@@ -269,7 +272,6 @@ void Uart2() interrupt 8 using 1
 {
 unsigned char c;
 	if(S2CON & S2RI) { //receive2 flagged
-		comms_timeout_count = TIMEOUT;
 		S2CON &= ~S2RI; //reset receive flag
 		c = S2BUF; //store buffer in c
 		if(c == STARTKEY) { //start key is received
@@ -291,45 +293,12 @@ unsigned char c;
 }
 
 /*----------------------------
-Initialize Timer0 sfr
-----------------------------*/
-void timer0_init() {
-	TL0 = (65536-FOSC/1000); //initialize timer0 low byte
-	TH0 = (65536-FOSC/1000) >> 8; //initialize timer0 high byte
-	TR0 = 1; //timer0 start running
-	ET0 = 1; //enable timer0 interrupt
-	comms_timeout_count = 0; //initial counter
-}
-
-/*----------------------------
-Timer0 interrupt routine
-----------------------------*/
-void tm0_isr() interrupt 1 using 1 {
-	TL0 = (65536-FOSC/1000); //initialize timer0 low byte
-	TH0 = (65536-FOSC/1000) >> 8; //initialize timer0 high byte
-	if(comms_timeout_count != 0) { //1ms * 1000 -> 1s
-		--comms_timeout_count;
-	}
-}
-
-/*----------------------------
-Software delay function
-----------------------------*/
-void delay(unsigned int n) {
-  unsigned int j;
-  while(n--) {
-    j = 5000;
-    while(j--);
-  }
-}
-
-/*----------------------------
 Append crc bytes to end of output array.
 ----------------------------*/
 void CRC_generator() {
 	unsigned short crcval = crcFast(output, OUT_COUNT-2); //compute the crc value from output array up to the actual crc elements
-	output[25] = (unsigned char)(crcval>>8); //append the first byte of the crcvalue to the output array
-	output[26] = (unsigned char)(crcval); //append the second byte of the crcvalue to the output array
+	output[OUT_COUNT-1] = (unsigned char)(crcval>>8); //append the first byte of the crcvalue to the output array
+	output[OUT_COUNT] = (unsigned char)(crcval); //append the second byte of the crcvalue to the output array
 }
 /*----------------------------
 Check crc of input_control array.
