@@ -1,0 +1,4 @@
+".\Objects\STARTUP.obj",
+".\Objects\main_board_checksum.obj" 
+TO ".\Objects\main_board" 
+PRINT(".\Listings\main_board.m51") RAMSIZE(256) 

@@ -1,0 +1,429 @@
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 1   
+
+
+C51 COMPILER V9.00, COMPILATION OF MODULE CONTROL_BOX_CHECKSUM
+OBJECT MODULE PLACED IN .\Objects\control_box_checksum.obj
+COMPILER INVOKED BY: C:\Keil_v4\C51\BIN\C51.EXE control_box_checksum.c LARGE OPTIMIZE(9,SIZE) BROWSE DEBUG OBJECTEXTEND 
+                    -PRINT(.\Listings\control_box_checksum.lst) OBJECT(.\Objects\control_box_checksum.obj)
+
+line level    source
+
+   1          //battery
+   2          //checksum
+   3          //oled communication
+   4          //tones
+   5          //communication timeout
+   6          //continue from autosolenoids  when override HIGH
+   7          /*************************************************************************
+   8           *  @File Descption: Read states of manual override buttons of control_box
+   9           *      and bi-directional communication via UART with main_board.
+  10           *      @File: control_box_firmware.c
+  11           *  @author(s):
+  12           *  -Tawfic Rabbani, Embedded Systems Engineer, head of software
+  13           *      -Matthew Santos, Electrical and Firmware Engineer
+  14           *  @Property of SEDS UCSD
+  15           *  @since: 10/2016
+  16           *************************************************************************/
+  17          //#include "reg60s2.h" //Include reg file for 8051 architecure
+  18          #include "STC/STC12C5A60S2.H"
+  19          #include "intrins.h" //for ADC
+  20          #include "math.h"
+  21          #define OUT_COUNT 16 //1 override + 12 solenoidstates + 1 encoder + 2 checkSum
+  22          #define IN_COUNT 71 //1 override + 12 solenoidstates + 56 IN_DAQ COUNT + 2 checkSum
+  23          #define OLED_COUNT 63 //1 override + 1 tone + 2 battlvl + 3 commsgood + 56 IN_DAQ COUNT
+  24          #define STARTKEY 0x55 //indicates beginning of an array message
+  25          #define NUM_SWITCHES 12
+  26          #define COM_TIMEOUT 2400        //how long communications must cease to warn user in units of 1.25 ms
+  27          /*Define UART operation const*/
+  28          #define FOSC 11059200L //system oscillator frequency
+  29          #define BAUD 9600 //baud rate
+  30          #define S2RI 0x01 //S2CON.0
+  31          #define S2TI 0x02 //S2CON.1
+  32          /*Define ADC operation const for ADC_CONTR*/
+  33          #define ADC_POWER   0x80 //ADC power control bit
+  34          #define ADC_FLAG    0x10 //ADC complete flag
+  35          #define ADC_START   0x08 //ADC start control bit
+  36          #define ADC_SPEEDLL 0x00 //540 clocks
+  37          #define ADC_SPEEDL  0x20 //360 clocks
+  38          #define ADC_SPEEDH  0x40 //180 clocks
+  39          #define ADC_SPEEDHH 0x60 //90 clocks
+  40          
+  41          /*************************************************************************
+  42           *                            -- VARIABLES --
+  43           *  Each variable is a pin on the MCU that can be read/write 1/0.
+  44           *  Syntax:
+  45           *       varaible-type  variable-name = pin;
+  46           *************************************************************************/
+  47          //sfr P4SW = 0xBB; //special register for using P4 pins as I/O
+  48          //sfr BRT = 0x9C; //special register for using baud rate timer
+  49          
+  50          sbit LED1 = P0^0;
+  51          sbit LED2 = P0^1;
+  52          sbit LED3 = P0^2;
+  53          sbit LED4 = P0^3;
+  54          sbit LED5 = P0^4;
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 2   
+
+  55          sbit LED6 = P0^5;
+  56          sbit LED12 = P0^6;
+  57          sbit LED11 = P0^7;
+  58          
+  59          sbit E0 = P1^0; //encoder pin 0
+  60          sbit E1 = P1^1; //encoder pin 1
+  61          
+  62          sbit GPIO1 = P1^4;
+  63          sbit GPIO2 = P1^5;
+  64          sbit BATTLVL = P1^6; //analog voltage reading of battery
+  65          sbit sw1 = P1^7;
+  66          
+  67          sbit LED7 = P2^7;
+  68          sbit sw12 = P2^6;
+  69          sbit sw11 = P2^5;
+  70          sbit sw10 = P2^4;
+  71          sbit sw9 = P2^3;
+  72          sbit sw8 = P2^2;
+  73          sbit swTOG = P2^1; //main override toggle switch
+  74          sbit LEDtog = P2^0; //main override indicator
+  75          
+  76          sbit sw2 = P3^2;
+  77          sbit sw3 = P3^3;
+  78          sbit sw4 = P3^4;
+  79          sbit sw5 = P3^5;
+  80          sbit sw6 = P3^6;
+  81          sbit sw7 = P3^7;
+  82          
+  83          sbit LED10 = P4^6;
+  84          sbit LED9 = P4^5;
+  85          sbit LED8 = P4^4;
+  86          
+  87          /*************************************************************************
+  88           *                           --PROTOTYPES--
+  89           *************************************************************************/
+  90          void uart_init(); //Initialize UART1 and UART2 sfr
+  91          void uart1_tx(unsigned char dat); //UART1 transmit single byte
+  92          void send(); //UART1 send output array
+  93          void uart2_tx(unsigned char dat); //UART2 transmit single byte
+  94          void update_OLED(); //update OLED
+  95          void adc_init(); //Initialize ADC sfr
+  96          void timer0_init(); //Initialize Timer0 sfr
+  97          void generateCheckSum();
+  98          void button_check();
+  99          void update_LEDS();
+ 100          unsigned char readBattery(unsigned char ch);
+ 101          void checkCheckSum();
+ 102          
+ 103          /*************************************************************************
+ 104           *                          --GLOBAL VARIABLES--
+ 105           *************************************************************************/
+ 106          /* Communication Arrays */
+ 107          //sequencestage,criticaldata,errormessages is just forwarded from input to arduino
+ 108          unsigned char input[IN_COUNT]; //stores all recieved inputs
+ 109          /* [0,override][1-14,solenoid states][13-16,errors][17-20,warnings][21-24,pressure valves][25-26,checkSum]
+             - */
+ 110          //SOLENOIDSTATES CAN BE 0=INACTIVE, 1=ACTIVE, 2=PENDING
+ 111          unsigned char output[OUT_COUNT]; //stores all commands to be sent
+ 112          /* [0,override][1-14,buttonpresses][5,encoder][6-7,checkSum] */
+ 113          unsigned char oled[OLED_COUNT]; //stores info for oled to display
+ 114          /* [0,override][1,tone][2,battlvl][3,commsgood][4,thrust][5,tank1p][6,tank1t][7,tank2p][8,tank2t][9-12,kbo
+             -t1-4][13-22,errormessages] */
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 3   
+
+ 115          //TONE CAN BE 0=none, 1=buttonpress, 2=overrideswitch, 3=error
+ 116          
+ 117          unsigned int i = 0; //for loops
+ 118          unsigned int timerCounter = 0; //for timer0 isr
+ 119          unsigned int comCounter = 0;
+ 120          bit inputChanged = 0;
+ 121          bit busy = 0; //boolean for UART TX holding
+ 122          bit storing = 0; //1 if currently updating RX array, 0 otherwise
+ 123          bit readSwitchesFlag = 0; //1 if input data has been updated, 0 otherwise
+ 124          bit updateLEDFlag = 0;
+ 125          bit checkBit1 = 0;
+ 126          bit checkBit2 = 0;
+ 127          unsigned char com;
+ 128          unsigned char ch = 6; //ADC channel number for BATTLVL
+ 129          unsigned char LED[NUM_SWITCHES+1];
+ 130          unsigned char lastState[NUM_SWITCHES+1];
+ 131          unsigned char currentState[NUM_SWITCHES+1];
+ 132          unsigned char debounceFlag[NUM_SWITCHES+1];
+ 133          unsigned char debounceCounter[NUM_SWITCHES+1];
+ 134          unsigned char LEDState = 0;
+ 135          unsigned int index = 0; //for UART RX array location
+ 136          //////////////////////////////////////////////////////////////////unsigned int debugsum=0;
+ 137          /*----------------------------
+ 138          Main loop.
+ 139          Initializes MCU registers, checks for constant communication,
+ 140          reads switches and buttons, sends commands with checkSum, updates
+ 141          leds and oled with new info.
+ 142          ----------------------------*/
+ 143          void main() {
+ 144   1              P4SW = 0x70; //enable IO for all of P4
+ 145   1              uart_init(); //Initialize UART1 and UART2 sfr.
+ 146   1              adc_init(); //Initialize ADC sfr
+ 147   1              timer0_init(); //Initialize Timer0 sfr
+ 148   1              EA = 1; //Open master interrupt switch
+ 149   1              while(1) { //loop forever
+ 150   2                      if(checkBit1){uart1_tx(0x99);}
+ 151   2                      else {uart1_tx(0x77);}
+ 152   2                      if(checkBit2){uart1_tx(0x99);}
+ 153   2                      else {uart1_tx(0x77);}
+ 154   2      //////////////////              if(checkBit){
+ 155   2                      for(i=0;i<=3000;i++){nop_();}     //////////////////////////////////////////////////////////
+ 156   2                      if(readSwitchesFlag==1){button_check(); readSwitchesFlag=0;} 
+ 157   2                      if(updateLEDFlag==1){update_LEDS();}
+ 158   2      //////////////////////////////////////////////////////////////////////////////////////}
+ 159   2      //METHOD TO COPY INPUT STATES TO OUTPUT STATES
+ 160   2                      send(); //transmit output 
+ 161   2      //              if (((LEDState/4)%2)&1==0 && checkBit){update_OLED();} //update OLED
+ 162   2              } //end while
+ 163   1      } //end main
+ 164          
+ 165          
+ 166          /*----------------------------
+ 167          Update OLED screen with info.
+ 168          ----------------------------*/
+ 169          void update_OLED() {                                                    //update array:
+ 170   1              oled[0] = output[0];            //override                                         
+ 171   1              //oled[1]                                       //tone doesn't need to be updated, updated elsewhere in code
+ 172   1              oled[2] = readBattery(1);       //battery level
+ 173   1              oled[3] = com;                          //communication updated elsewhere       
+ 174   1              for(i = 0; i < OLED_COUNT; i++) {uart2_tx(oled[i]);}            //send the oled array
+ 175   1              oled[1]=0;              //set tone  back to zero
+ 176   1      }
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 4   
+
+ 177          
+ 178          /*----------------------------
+ 179          Initialize UART1 and UART2 sfr.
+ 180          Data buffer is set to 8 bit length,
+ 181          baud rate set to 9600 baud,
+ 182          uart interrupt is enabled.
+ 183          ----------------------------*/
+ 184          void uart_init() {
+ 185   1              SCON = 0x50; //8-bit variable UART1
+ 186   1              TMOD = 0x21; //timer1 in mode2. timer0 in mode1
+ 187   1              TH1 = TL1 = -(FOSC/12/32/BAUD); //Set auto-reload vaule
+ 188   1              TR1 = 1; //Timer 1 enable
+ 189   1              ES = 1; //Enable UART interrupt
+ 190   1              
+ 191   1              S2CON = 0x50; //8-bit variable UART2
+ 192   1              BRT = -(FOSC/32/BAUD); //Set auto-reload vaule of baudrate generator
+ 193   1              AUXR = 0xF5; //see datashee pg185
+ 194   1              IE2 = 0x01; //Enable UART2 interrupt
+ 195   1              
+ 196   1              for(i = 0; i < OUT_COUNT; ++i) //initialize output array to zeros
+ 197   1                      output[i] = 0;
+ 198   1              for(i = 0; i < IN_COUNT; ++i) //initialize input array to zeros
+ 199   1                      input[i] = 0;
+ 200   1              for(i = 0; i < OLED_COUNT; ++i) //initialize oled array to zeros
+ 201   1                      oled[i] = 0;
+ 202   1      }
+ 203          
+ 204          /*----------------------------
+ 205          UART1 interrupt routine.
+ 206          Updates the input array.
+ 207          ----------------------------*/
+ 208          void Uart_Isr() interrupt 4 using 1 {
+ 209   1              unsigned char c;
+ 210   1              if(RI) { //receive1 flagged
+ 211   2                      RI = 0; //reset receive flag
+ 212   2                      c = SBUF; //store buffer in c
+ 213   2                      if(storing) { //we are in storing mode
+ 214   3                              input[index] = c; //store SBUF in current index of array
+ 215   3                              index++; //increment array index
+ 216   3                      } else if(c == STARTKEY) { //start key is received
+ 217   3                              storing = 1; //set that we are now storing
+ 218   3                              index = 0; //start from beginning of array by resetting index
+ 219   3                      }
+ 220   2                      if(index >= IN_COUNT) { //read in enough values
+ 221   3                              checkCheckSum();
+ 222   3                              storing = 0; //set that we are done storing
+ 223   3                              inputChanged = 1; //tell the program that new data has been delivered
+ 224   3                      }       
+ 225   2              }       
+ 226   1              if(TI) { //transmit1 flagged
+ 227   2                      TI = 0; //Clear transmit interrupt flag
+ 228   2                      busy = 0; //Clear transmit busy flag
+ 229   2              }
+ 230   1      }
+ 231          
+ 232          /*----------------------------
+ 233          UART1 transmit single byte
+ 234          ----------------------------*/
+ 235          void uart1_tx(unsigned char dat) {
+ 236   1              while(busy); //Wait for the completion of the previous data is sent
+ 237   1              busy = 1; //set transmit busy flag
+ 238   1              SBUF = dat; //Send data to UART buffer
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 5   
+
+ 239   1      }
+ 240          
+ 241          /*----------------------------
+ 242          UART1 send output array
+ 243          ----------------------------*/
+ 244          void send() {
+ 245   1              uart1_tx(STARTKEY);
+ 246   1              generateCheckSum(); 
+ 247   1              for(i = 0; i < OUT_COUNT; ++i) {uart1_tx(output[i]);}
+ 248   1      }
+ 249          
+ 250          /*----------------------------
+ 251          UART2 interrupt routine
+ 252          ----------------------------*/
+ 253          void Uart2() interrupt 8 using 1 {
+ 254   1          if(S2CON & S2RI) { //Does nothing with received data
+ 255   2              S2CON &= ~S2RI; //Clear receive interrupt flag
+ 256   2          }
+ 257   1          if(S2CON & S2TI) { //transmit2 flagged
+ 258   2              S2CON &= ~S2TI; //Clear transmit interrupt flag
+ 259   2              busy = 0; //Clear transmit busy flag
+ 260   2          }
+ 261   1      }
+ 262          
+ 263          /*----------------------------
+ 264          UART2 transmit single byte
+ 265          ----------------------------*/
+ 266          void uart2_tx(unsigned char dat) {
+ 267   1          while(busy); //Wait for the completion of the previous data is sent
+ 268   1          busy = 1; //set transmit flag to busy
+ 269   1          S2BUF = dat; //Send data to UART2 buffer
+ 270   1      }
+ 271          
+ 272          /*----------------------------
+ 273          Initialize ADC sfr
+ 274          ----------------------------*/
+ 275          void adc_init() {
+ 276   1              P1ASF = 0x03; //set P1.0 and P1.1 as analog input ports
+ 277   1              ADC_RES = 0; //Clear previous result
+ 278   1              ADC_CONTR = ADC_POWER | ADC_SPEEDLL; //set register
+ 279   1              for(i=0;i<10;i++){nop_();} //ADC power-on delay and Start A/D conversion
+ 280   1              IE = 0xb0; //Enable ADC and UART interrupt and Open master interrupt switch
+ 281   1      }
+ 282          
+ 283          /*----------------------------
+ 284          Initialize Timer0 sfr
+ 285          ----------------------------*/
+ 286          void timer0_init() {
+ 287   1              TL0 = 0xFF; //initialize timer0 low byte          65535-(11059200/12/800)=FB7F
+ 288   1              TH0 = 0xED; //initialize timer0 high byte
+ 289   1              TR0 = 1; //timer0 start running
+ 290   1              ET0 = 1;} //enable timer0 interrupt
+ 291          
+ 292          
+ 293          void writeOutput(char index){
+ 294   1              if (output[0]==1){
+ 295   2                      if (debounceFlag[index]==1 && currentState[index]==1 && lastState[index]==1){debounceCounter[index]++;}
+ 296   2                      else if (debounceFlag[index]==1 && currentState[index]==0 && lastState[index]==1 && debounceCounter[inde
+             -x]>=3){
+ 297   3                              debounceFlag[index]=0; debounceCounter[index]=0; oled[1]=1;
+ 298   3                              if (output[index]==0){output[index]=1;}
+ 299   3                              else if (output[index]==1){output[index]=0;}}
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 6   
+
+ 300   2                      else if (currentState[index]==1 && lastState[index]==0){debounceFlag[index]=1;}
+ 301   2                      lastState[index]=currentState[index];}
+ 302   1              else{output[index]=input[index];}}
+ 303          
+ 304          void button_check(){
+ 305   1              for(i=1; i<=NUM_SWITCHES;i++){writeOutput(i);}
+ 306   1              output[0]=swTOG;
+ 307   1              currentState[1]=sw1;    
+ 308   1              currentState[2]=sw2;
+ 309   1              currentState[3]=sw3;
+ 310   1              currentState[4]=sw4;
+ 311   1              currentState[5]=sw5;
+ 312   1              currentState[6]=sw6;
+ 313   1              currentState[7]=sw7;
+ 314   1              currentState[8]=sw8;
+ 315   1              currentState[9]=sw9;
+ 316   1              currentState[10]=sw10;
+ 317   1              currentState[11]=sw11;
+ 318   1              currentState[12]=sw12;
+ 319   1      //      sw13=currentState[13];
+ 320   1      //      sw14=currentState[14];
+ 321   1      }
+ 322          
+ 323          void update_LEDS(){
+ 324   1              LEDtog=input[0]&1;
+ 325   1              if (input[1] <= 1){LED1=!(bit)(input[1]&1);}
+ 326   1              else {LED1=((LEDState/4)%2)&1;}
+ 327   1              if (input[2] <= 1){LED2=!(bit)(input[2]&1);}
+ 328   1              else {LED2=((LEDState/4)%2)&1;}
+ 329   1              if (input[3] <= 1){LED3=!(bit)(input[3]&1);}
+ 330   1              else {LED3=((LEDState/4)%2)&1;}
+ 331   1              if (input[4] <= 1){LED4=!(bit)(input[4]&1);}
+ 332   1              else {LED4=((LEDState/4)%2)&1;}
+ 333   1              if (input[5] <= 1){LED5=!(bit)(input[5]&1);}
+ 334   1              else {LED5=((LEDState/4)%2)&1;}
+ 335   1              if (input[6] <= 1){LED6=!(bit)(input[6]&1);}
+ 336   1              else {LED6=((LEDState/4)%2)&1;}
+ 337   1              if (input[7] <= 1){LED7=!(bit)(input[7]&1);}
+ 338   1              else {LED7=((LEDState/4)%2)&1;}
+ 339   1              if (input[8] <= 1){LED8=!(bit)(input[8]&1);}
+ 340   1              else {LED8=((LEDState/4)%2)&1;}
+ 341   1              if (input[9] <= 1){LED9=!(bit)(input[9]&1);}
+ 342   1              else {LED9=((LEDState/4)%2)&1;}
+ 343   1              if (input[10] <= 1){LED10=!(bit)(input[10]&1);}
+ 344   1              else {LED10=((LEDState/4)%2)&1;}
+ 345   1              if (input[11] <= 1){LED11=!(bit)(input[11]&1);}
+ 346   1              else {LED11=((LEDState/4)%2)&1;}
+ 347   1              if (input[12] <= 1){LED12=!(bit)(input[12]&1);}
+ 348   1              else {LED12=((LEDState/4)%2)&1;}
+ 349   1      //      if (input[13] <= 1){LED13=!input[13]&1;}
+ 350   1      //      else {LED13=((LEDState/4)%2)&1;}
+ 351   1      //      if (input[14] <= 1){LED14=!input[14]&1;}
+ 352   1      //      else {LED14=((LEDState/4)%2)&1;}
+ 353   1      }
+ 354          
+ 355          /*----------------------------
+ 356          Timer0 interrupt routine
+ 357          ----------------------------*/
+ 358          void tm0_isr() interrupt 1 using 1 {
+ 359   1              TL0 = 0xFF;   //initialize timer0 low byte       65535-(11059200/12/200)=EDFF
+ 360   1              TH0 = 0xED;   //initialize timer0 high byte
+ 361   1              timerCounter++;
+C51 COMPILER V9.00   CONTROL_BOX_CHECKSUM                                                  11/18/2017 17:47:29 PAGE 7   
+
+ 362   1              readSwitchesFlag=1;
+ 363   1              if (inputChanged==0){comCounter++;
+ 364   2                      if(comCounter>=COM_TIMEOUT){com=1; oled[1]=2;}}
+ 365   1              else{comCounter=0; inputChanged=0; com=0;}
+ 366   1              if(timerCounter%50==0){updateLEDFlag=1; LEDState++;}
+ 367   1              if(timerCounter==800){timerCounter=0;}}
+ 368          
+ 369          
+ 370          unsigned char readBattery(unsigned char ch){
+ 371   1          ADC_CONTR = ADC_POWER | ADC_SPEEDLL | ch | ADC_START;
+ 372   1          _nop_(); _nop_(); _nop_(); _nop_(); 
+ 373   1          while (!(ADC_CONTR & ADC_FLAG));//Wait complete flag
+ 374   1          ADC_CONTR &= ~ADC_FLAG;         //Close ADC
+ 375   1          return ADC_RES;}                //Return ADC result
+ 376          
+ 377          void generateCheckSum(){
+ 378   1          unsigned int sum=0; unsigned int b;
+ 379   1          for (b = 0; b < OUT_COUNT-2; ++b) {sum+=output[b];}
+ 380   1              output[OUT_COUNT-2]=(unsigned char)(sum>>8); 
+ 381   1              output[OUT_COUNT-1]=(unsigned char)sum;}
+ 382          
+ 383          void checkCheckSum(){
+ 384   1          unsigned int sum=0; unsigned int b;
+ 385   1              for (b = 0; b < IN_COUNT-2; ++b) {sum+=input[b];}////////////////////////////////////////////////////////
+             -////// debugsum=sum;
+ 386   1          if (input[IN_COUNT-2]==(unsigned char)(sum>>8)){checkBit1=1;}
+ 387   1              else {checkBit1=0;}
+ 388   1              if (input[IN_COUNT-1]==(unsigned char)sum){checkBit2=1;}
+ 389   1              else {checkBit2=0;}}
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1423    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =    226    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =      7    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

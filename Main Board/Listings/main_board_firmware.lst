@@ -1,0 +1,373 @@
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 1   
+
+
+C51 COMPILER V9.00, COMPILATION OF MODULE MAIN_BOARD_FIRMWARE
+OBJECT MODULE PLACED IN .\Objects\main_board_firmware.obj
+COMPILER INVOKED BY: C:\Keil_v4\C51\BIN\C51.EXE main_board_firmware.c LARGE BROWSE DEBUG OBJECTEXTEND PRINT(.\Listings\m
+                    -ain_board_firmware.lst) OBJECT(.\Objects\main_board_firmware.obj)
+
+line level    source
+
+   1          //
+   2          /*************************************************************************
+   3           *  @File Descption: Read states of manual override buttons of control_box,
+   4           *  forward them to solenoids, receives feedback from DAQ and forwards to 
+   5           *  control board along with solenoid state information
+   6           *      @File: main_board_firmware.c
+   7           *  @author(s):
+   8           *  -Cristian Sharp, Merp
+   9           *      -Matthew Santos, Electrical and Software Engineer
+  10           *  @Property of SEDS UCSD
+  11           *  @since: 4/2017
+  12           *************************************************************************/
+  13          //#include "reg60s2.h" //Include reg file for 8051 architecure
+  14          #include "STC/STC12C5A60S2.H"
+  15          #include "intrins.h"
+  16          #include "crc.h" //for crc generator
+  17          #include "math.h"
+  18          #define IN_CONTROL_COUNT 18 //1 override + 14 solenoidstates + 1 encoder + 2 crc
+  19          #define IN_DAQ_COUNT 56 //34 errors or warnings + 4 T tank1 + 4 T tank2 + 4 P tank1 + 4 P tank2 + 6 bytes 
+             -for kbot1-3
+  20          #define NUM_OF_SWITCHES 12 //total number of switches not including toggle
+  21          #define OUT_COUNT IN_DAQ_COUNT+NUM_OF_SWITCHES+3 //1 override + 12 switches + 56 IN_DAQ COUNT + 2 crc
+  22          #define STARTKEY 0x55 //indicates beginning of an array message
+  23          /*Define UART operation const*/
+  24          #define FOSC 11059200L //system oscillator frequency
+  25          #define BAUD 9600 //baud rate
+  26          #define S2RI 0x01 //S2CON.0
+  27          #define S2TI 0x02 //S2CON.1
+  28          /*************************************************************************
+  29           *                            -- VARIABLES --
+  30           *  Each variable is a pin on the MCU that can be read/write 1/0.
+  31           *  Syntax:
+  32           *       varaible-type  variable-name = pin;
+  33           *************************************************************************/
+  34          // CHANGE ALL VARS AND ADJUST
+  35          sbit ACT_MUX_S = P3^5;
+  36          
+  37          sbit A1 = P0^0;
+  38          sbit A2 = P0^1;
+  39          sbit A3 = P0^2;
+  40          sbit A4 = P0^3;
+  41          sbit A5 = P0^4;
+  42          sbit A6 = P0^5;
+  43          sbit A7 = P0^6;
+  44          sbit A8 = P0^7;
+  45          sbit A9 = P2^7;
+  46          sbit A10 = P2^6;
+  47          sbit A11 = P2^5;
+  48          sbit A12 = P2^4;
+  49          
+  50          sbit IN_MUX_S = P1^0;
+  51          sbit IN_MUX_E = P1^1;
+  52          sbit MUX_OUT1 = P1^4;
+  53          sbit MUX_OUT2 = P1^5;
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 2   
+
+  54          sbit MUX_OUT3 = P1^6;
+  55          sbit MUX_OUT4 = P1^7;
+  56          /*************************************************************************
+  57           *                                   --PROTOTYPES--
+  58           *************************************************************************/
+  59          
+  60          void uart_init(); //Initialize UART1 and UART2 sfr
+  61          void uart1_tx(unsigned char dat); //UART1 transmit single byte
+  62          void send(); //UART1 send output array
+  63          void delay(unsigned int n); //Software delay function
+  64          void CRC_generator();  //in send() function
+  65          bit CRC_check();
+  66          void update_output_array();
+  67          void solenoid_data();
+  68          
+  69          /*************************************************************************
+  70           *                          --GLOBAL VARIABLES--
+  71           *************************************************************************/
+  72          
+  73          /* Communication Arrays */
+  74          //sequencestage,criticaldata,errormessages is just forwarded from input_control to arduino
+  75          unsigned char output[OUT_COUNT]; //stores all recieved inputs
+  76          /* [0,override][1-12,solenoid states][13-16,errors][17-20,warnings][21-24,pressure valves][25-26,crc] */
+  77          //SOLENOIDSTATES CAN BE 0=INACTIVE, 1=ACTIVE, 2=PENDING
+  78          unsigned char input_control[IN_CONTROL_COUNT]; //stores all commands to be sent
+  79          /* [0,override][1-12,buttonpresses][14-15,crc] */
+  80          unsigned char input_DAQ[IN_DAQ_COUNT]; //stores all commands to be sent
+  81          /* [0-3,errors][4-7,warnings][8-11,pressure valves] */
+  82          unsigned char switchs[NUM_OF_SWITCHES+1];
+  83          unsigned char i = 0; //for loops
+  84          bit busy; //boolean for UART TX holding
+  85          bit inputChanged = 0;
+  86          xdata unsigned char index_control = 0; //for UART RX array location
+  87          unsigned char index_DAQ = 0; //for UART RX array location
+  88          bit storing_DAQ = 0; //1 if currently updating RX2 (input_DAQ) array, 0 otherwise
+  89          bit storing_control = 0; //1 if currently updating RX1 (input_control) array, 0 otherwise
+  90          bit input_switch_bit = 0;
+  91          bit checkCRC;
+  92          
+  93          /*************************************************************************
+  94           *                          -- MAIN FUNCTION --
+  95           *  @Descption: The unsigned char array "input_control" stores commands from 
+  96           *              control board. "input_DAQ" stores info from DAQ. "output"
+  97           *              stores info about solenoid states and info from the DAQ                         
+  98           *
+  99           *  @PRECONDITION: none
+ 100           *
+ 101           *  @POSTCONDITION: -connenction between two MCU's will be complete
+ 102           *                  -commands will be received and delt with
+ 103           *                  -commands will be sent to other MCU
+ 104           *
+ 105           *  @PARAMETER: none
+ 106           *
+ 107           *  @RETURN: none
+ 108           *************************************************************************/
+ 109          void main() {   
+ 110   1              crc_init();
+ 111   1              P4SW = 0x70; //enable IO for all of P4
+ 112   1              uart_init(); //Initialize UART1 and UART2 sfr
+ 113   1              EA = 1; //Open master interrupt switch
+ 114   1              while(1) {
+ 115   2                      solenoid_data();                 //collect data about solenoid states                                                                               
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 3   
+
+ 116   2                      update_output_array();   //update output array using that info                                                  
+ 117   2                      send();                                  //and send that composite data to control board
+ 118   2      //              if(inputChanged==1){
+ 119   2      //                      inputChanged=0;
+ 120   2      //                      uart1_tx(0x77);
+ 121   2      //                      for(i = 0; i < IN_CONTROL_COUNT; i++) {  //send entire output array 
+ 122   2      //                              uart1_tx(input[i]);                      //include "override" char so that control board knows 
+ 123   2      //                      }                                                                        //if it is interpreting solenoid state values
+ 124   2      //              }
+ 125   2              }        
+ 126   1      } //end main
+ 127          
+ 128          /*----------------------------
+ 129          Takes info from DAQ (stored in input_DAQ)
+ 130          and info from control board (stored in 
+ 131          input_control) and updates output array.
+ 132          CRC_generator (called at end of function) also 
+ 133          changes last 2 values of output array.
+ 134          output array is later sent to control board
+ 135          through UART1 in the send() function 
+ 136          ----------------------------*/
+ 137          void update_output_array() {
+ 138   1              output[0]=input_control[0];                        
+ 139   1              if(input_control[0]==1 /*&& checkCRC==1*/)      //if override is 1 and CRC_check is 1, send override 
+ 140   1              {                                                                                       //values to A1 through A12. 
+ 141   2                      ACT_MUX_S=0;
+ 142   2                      //forward override switch values to solenoids 
+ 143   2                      A1=!input_control[1]; A2=!input_control[2]; A3=!input_control[3]; 
+ 144   2                      A4=!input_control[4]; A5=!input_control[5]; A6=!input_control[6]; 
+ 145   2                      A7=!input_control[7]; A8=!input_control[8]; A9=!input_control[9]; 
+ 146   2                      A10=!input_control[10]; A11=!input_control[11]; A12=!input_control[12];
+ 147   2      //              A13=input_control[13]; A14=input_control[14];
+ 148   2                      for(i=1;i<=NUM_OF_SWITCHES;i++)
+ 149   2                      {
+ 150   3                              if(input_control[i]==0 && switchs[i]==0)                         //Compare values of A1-A12 to actual solenoid states
+ 151   3                              {                                                       //1=active                       //and store that comparison in output array so that it                 
+ 152   4                                      output[i] = 0;                   //gets sent to control board through UART1. 
+ 153   4                              }                                                                                                               
+ 154   3                              else if (switchs[i] != input_control[i])
+ 155   3                              {                                                  //2=pending (switched HIGH, but solenoid is not actually HIGH yet)
+ 156   4                                      output[i] = 2;
+ 157   4                              }
+ 158   3                              else if (switchs[i]==1)
+ 159   3                              {
+ 160   4                                      output[i] = 1;
+ 161   4                              }
+ 162   3                      }                                                                 
+ 163   2              }                                                                       
+ 164   1              else                                                            
+ 165   1              {                                                                       //if CRC doesn't check or override is LOW, do not forward inputs
+ 166   2                      ACT_MUX_S=1;                                    //and set ACT_MUX_S to HIGH so solenoids take commands from DAQ
+ 167   2                      for(i=1;i<=NUM_OF_SWITCHES;i++) //instead of control board
+ 168   2                      {         
+ 169   3                              output[i] = switchs[i];
+ 170   3                      }
+ 171   2              }                               
+ 172   1              for(i=1;i<=IN_DAQ_COUNT;i++)                     //update output array with info from DAQ (UART2) to control board via UAR
+             -T1
+ 173   1              {                                                                        
+ 174   2                      output[1+NUM_OF_SWITCHES+i] = input_DAQ[i-1];  
+ 175   2              }                           
+ 176   1      }
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 4   
+
+ 177          
+ 178          /*----------------------------
+ 179          Uses IN_MUX pins to select info about
+ 180          solenoids and their states and stores
+ 181          that info in switchs array
+ 182          ----------------------------*/
+ 183          void solenoid_data() {
+ 184   1              IN_MUX_S = 1;                                                                     
+ 185   1              IN_MUX_E = 1;           for(i=0;i<=20;i++){nop_();}
+ 186   1              switchs[2] = !MUX_OUT1;   //even top
+ 187   1              switchs[4] = !MUX_OUT2;   
+ 188   1              switchs[6] = !MUX_OUT3;
+ 189   1              switchs[8] = !MUX_OUT4; 
+ 190   1              IN_MUX_S = 1;
+ 191   1              IN_MUX_E = 0;            for(i=0;i<=20;i++){nop_();}
+ 192   1              switchs[10] = !MUX_OUT1;
+ 193   1              switchs[12] = !MUX_OUT2;
+ 194   1      //      switchs[14] = MUX_OUT3;   //maybe adding more solenoids in the future?
+ 195   1          IN_MUX_S = 0;
+ 196   1              IN_MUX_E = 1;      for(i=0;i<=20;i++){nop_();}
+ 197   1              switchs[1] = !MUX_OUT1;   //odd bottom
+ 198   1              switchs[3] = !MUX_OUT2;
+ 199   1              switchs[5] = !MUX_OUT3;
+ 200   1              switchs[7] = !MUX_OUT4;
+ 201   1              IN_MUX_S = 0;
+ 202   1              IN_MUX_E = 0;     for(i=0;i<=20;i++){nop_();}
+ 203   1              switchs[9] = !MUX_OUT1;
+ 204   1              switchs[11] = !MUX_OUT2;          
+ 205   1      //  switchs[13] = MUX_OUT3;             //maybe adding more solenoids in the future?                
+ 206   1      }
+ 207          
+ 208          /*----------------------------
+ 209          Initialize UART1 and UART2 sfr.
+ 210          Data buffer is set to 8 bit length,
+ 211          baud rate set to 9600 baud,
+ 212          uart interrupt is enabled.
+ 213          ----------------------------*/
+ 214          void uart_init() {
+ 215   1              SCON = 0x50; //8-bit variable UART1
+ 216   1              TMOD = 0x21; //timer1 in mode2. timer0 in mode1
+ 217   1              TH1 = TL1 = -(FOSC/12/32/BAUD); //Set auto-reload vaule
+ 218   1              TR1 = 1; //Timer 1 enable
+ 219   1              ES = 1; //Enable UART interrupt
+ 220   1              
+ 221   1              S2CON = 0x50; //8-bit variable UART2
+ 222   1              BRT = -(FOSC/32/BAUD); //Set auto-reload vaule of baudrate generator
+ 223   1              AUXR = 0xF5; //see datashee pg185
+ 224   1              IE2 = 0x01; //Enable UART2 interrupt
+ 225   1              //IE2   = 0xaf;
+ 226   1              for(i = 0; i < OUT_COUNT; i++) //initialize output array to zeros
+ 227   1                      output[i] = 0;
+ 228   1              for(i = 0; i < IN_CONTROL_COUNT; i++) //initialize input_control array to zeros
+ 229   1                      input_control[i] = 0;
+ 230   1              for(i = 0; i < IN_DAQ_COUNT; i++) //initialize input_control array to zeros
+ 231   1                      input_DAQ[i] = 0;
+ 232   1              for(i = 0; i < NUM_OF_SWITCHES; i++) //initialize input_control array to zeros
+ 233   1                      switchs[i] = 0;
+ 234   1      }
+ 235          
+ 236          
+ 237          
+ 238          
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 5   
+
+ 239          
+ 240          /*----------------------------
+ 241          UART1 interrupt routine.
+ 242          Updates the input_control array.
+ 243          ----------------------------*/
+ 244          void Uart_Isr() interrupt 4 {
+ 245   1              unsigned char c=0;
+ 246   1              if(RI) { //receive1 flagged
+ 247   2                      RI = 0; //reset receive flag
+ 248   2                      c = SBUF; //store buffer in c
+ 249   2                      if(storing_control) { //we are in storing_control mode
+ 250   3                              input_control[index_control] = c; //store SBUF in current index_control of array
+ 251   3                              index_control++; //increment array index
+ 252   3                      }
+ 253   2                      else if(c == STARTKEY) { //start key is received
+ 254   3                              storing_control = 1; //set that we are now storing_control
+ 255   3                              index_control = 0; //start from beginning of array
+ 256   3                      } 
+ 257   2                      if(index_control >= IN_CONTROL_COUNT) { //read in enough values
+ 258   3                              storing_control = 0; //set that we are done storing_control
+ 259   3                              checkCRC=CRC_check();
+ 260   3                      }
+ 261   2      
+ 262   2              }       
+ 263   1              if(TI) { //transmit1 flagged
+ 264   2                      TI = 0; //Clear transmit interrupt flag
+ 265   2                      busy = 0; //Clear transmit busy flag
+ 266   2              }
+ 267   1      }
+ 268          
+ 269          /*----------------------------
+ 270          UART1 transmit single byte
+ 271          ----------------------------*/
+ 272          void uart1_tx(unsigned char dat) {
+ 273   1              while(busy); //Wait for the completion of the previous data is sent
+ 274   1              busy = 1; //set transmit busy flag
+ 275   1              SBUF = dat; //Send data to UART buffer
+ 276   1      }
+ 277          
+ 278          /*----------------------------
+ 279          UART1 send output array
+ 280          ----------------------------*/
+ 281          void send() {
+ 282   1              uart1_tx(STARTKEY);                                      //send startbyte
+ 283   1              CRC_generator();                                                 
+ 284   1              for(i = 0; i < OUT_COUNT; i++) {         //send entire output array 
+ 285   2                      uart1_tx(output[i]);                     //include "override" char so that control board knows 
+ 286   2              }                                                                        //if it is interpreting solenoid state values or the state 
+ 287   1      }                                                                                //of the solenoid compared to its corresponding button
+ 288          
+ 289          /*----------------------------
+ 290          UART2 interrupt service routine
+ 291          ----------------------------*/
+ 292          void Uart2() interrupt 8 using 1
+ 293          {
+ 294   1      unsigned char d;
+ 295   1              if(S2CON & S2RI) { //receive2 flagged
+ 296   2                      S2CON &= ~S2RI; //reset receive flag
+ 297   2                      d = S2BUF; //store buffer in d
+ 298   2                      if(storing_DAQ) { //we are in storing_DAQ mode
+ 299   3                              input_DAQ[index_DAQ] = d; //store SBUF in current index_control of array
+ 300   3                              index_DAQ++; //increment array index
+C51 COMPILER V9.00   MAIN_BOARD_FIRMWARE                                                   11/04/2017 15:19:13 PAGE 6   
+
+ 301   3                      } else if(d == STARTKEY) { //start key is received
+ 302   3                              storing_DAQ = 1; //set that we are now storing_DAQ
+ 303   3                              index_DAQ = 0; //start from beginning of array
+ 304   3                      } 
+ 305   2                      if(index_DAQ >= IN_DAQ_COUNT) { //read in enough values
+ 306   3                              storing_DAQ = 0; //set that we are done storing_DAQ
+ 307   3                      }
+ 308   2              }       
+ 309   1              if(S2CON & S2TI) { //transmit1 flagged
+ 310   2                      S2CON &= ~S2TI; //Clear transmit interrupt flag
+ 311   2                      busy = 0; //Clear transmit busy flag
+ 312   2              }
+ 313   1      }
+ 314          
+ 315          /*----------------------------
+ 316          Append crc bytes to end of output array.
+ 317          ----------------------------*/
+ 318          void CRC_generator() {
+ 319   1              unsigned short crcval = crcFast(output, OUT_COUNT-2); //compute the crc value from output array up to the
+             - actual crc elements
+ 320   1              output[OUT_COUNT-1] = (unsigned char)(crcval>>8); //append the first byte of the crcvalue to the output a
+             -rray
+ 321   1              output[OUT_COUNT] = (unsigned char)(crcval); //append the second byte of the crcvalue to the output array
+ 322   1      }
+ 323          /*----------------------------
+ 324          Check crc of input_control array.
+ 325          1 if good data, 0 otherwise.
+ 326          ----------------------------*/
+ 327          bit CRC_check() {
+ 328   1              unsigned short crcval = crcFast(input_control, IN_CONTROL_COUNT-2); //compute the crc value from input_co
+             -ntrol array up to the actual crc elements
+ 329   1              if(((unsigned char)(crcval>>8) == input_control[IN_CONTROL_COUNT-1])
+ 330   1                      && ((unsigned char)(crcval) == input_control[IN_CONTROL_COUNT])) {
+ 331   2                              return 1;
+ 332   2              }
+ 333   1              return 0;
+ 334   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1331    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =    673      11
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =      6    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

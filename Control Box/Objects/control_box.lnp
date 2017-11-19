@@ -1,0 +1,4 @@
+".\Objects\STARTUP.obj",
+".\Objects\control_box_checksum.obj" 
+TO ".\Objects\control_box" 
+PRINT(".\Listings\control_box.m51") RAMSIZE(256) 
